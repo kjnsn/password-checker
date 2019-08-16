@@ -1,4 +1,4 @@
-# NIST Bad Password Checker
+# Bad Password Checker
 
 This is a simple service that checks a password against a dictionary of common
 passwords. The service then returns a response informing the caller whether or
