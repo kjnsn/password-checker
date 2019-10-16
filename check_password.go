@@ -14,13 +14,17 @@
 package passwordchecker
 
 import (
-	"encoding/json"
-	"net/http"
+	"bufio"
 	"context"
+	"encoding/json"
+	"flag"
+	"log"
+	"net/http"
 	"time"
 
-	"github.com/willf/bloom"
+	"cloud.google.com/go/storage"
 	"github.com/rs/cors"
+	"github.com/willf/bloom"
 )
 
 // RequestInput defines what the input looks like to the cloud function.
@@ -28,18 +32,32 @@ type RequestInput struct {
 	Cleartext string `json:"cleartext"`
 }
 
+type Response struct {
+	IsCommon bool `json:"is_common"`
+}
+
 var (
-	filter *bloom.BloomFilter
-	c = cors.AllowAll()
+	filter          *bloom.BloomFilter
+	c               = cors.AllowAll()
 	initializedChan = make(chan struct{})
+
+	bucket     = flag.String("bucket", "password-check-fn-km-dictionary", "The cloud bucket that contains the password dictionary")
+	objectName = flag.String("object", "dictionary.txt", "Name of the dictionary object in the bucket")
 )
 
 func init() {
-	n := uint(1000)
-	filter = bloom.New(20*n, 5)
+	n := uint(1000000)
+	filter = bloom.NewWithEstimates(n, 0.00001)
 
 	go func() {
-		// Initialise the bloom filter here.
+		// Initialise the bloom filter.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := populateFilter(ctx); err != nil {
+			// Cannot function without the filter.
+			log.Fatalf("Attempted to populate filter, got error %q", err.Error())
+		}
+
 		close(initializedChan)
 	}()
 }
@@ -47,17 +65,19 @@ func init() {
 // CheckPassword returns 200 if the password is okay, or 400
 // if the password has been found in the dictionary.
 func CheckPassword(w http.ResponseWriter, r *http.Request) {
+	// Only wait for 1 second for the system to initialize before failing fast.
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	// Wait for the bloom filter to initialise before processing the request.
 	select {
 	case <-ctx.Done():
-		http.Error(w, ctx.Err().Error(), 500)
+		http.Error(w, ctx.Err().Error(), http.StatusServiceUnavailable)
 		return
 	case <-initializedChan:
 	}
 
+	// Add CORS headers.
 	c.HandlerFunc(w, r)
 
 	defer r.Body.Close()
@@ -73,9 +93,37 @@ func CheckPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
+	isCommon := filter.TestString(input.Cleartext)
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(&Response{
+		IsCommon: isCommon,
+	}); err != nil {
+		http.Error(w, "Could not marshal response", http.StatusInternalServerError)
+	}
 }
 
-func getPasswordDictionary(ctx context.Context) ([]byte, error) {
-	return []byte{}, nil
+// PopulateFilter reads a dictionary from a cloud storage bucket
+// and populates the bloom filter with the newline delimited words
+// in that dictionary.
+func populateFilter(ctx context.Context) (err error) {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = client.Close() }()
+	rc, err := client.Bucket(*bucket).Object(*objectName).NewReader(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { err = rc.Close() }()
+
+	// Read each word (delimited by newlines) from the object.
+	scanner := bufio.NewScanner(rc)
+	n := 0
+	for scanner.Scan() {
+		filter.Add(scanner.Bytes())
+		n++
+	}
+	log.Printf("Added %d words to the filter", n)
+	return scanner.Err()
 }
